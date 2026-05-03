@@ -68,6 +68,11 @@ QUERIES = [
         "sql_file": "resultado_primario_nominal.sql",
         "transform": "resultado_primario_nominal",
     },
+    {
+        "file": "poupanca_corrente.json",
+        "sql_file": "poupanca_corrente.sql",
+        "transform": "poupanca_corrente",
+    },
 ]
 
 
@@ -736,6 +741,124 @@ def save_rcl_gz(D_obj):
     log.info(f"  rcl.json.gz -- {len(D_obj.get('colunas', []))} meses, {size_kb:.1f} KB")
 
 
+def build_poupanca_corrente_data(rows):
+    """
+    Computa Poupança Corrente (Art. 167-A, CF) com janela móvel de 12 meses.
+    Formula: (Desp. Liquidadas 12m + RPNP Inscrito - RPNP Cancelado) / Rec. Corrente 12m
+    """
+    ano_atual    = datetime.now().year
+    ano_anterior = ano_atual - 1
+
+    rec      = {ano_anterior: {m: 0.0 for m in range(1, 13)},
+                ano_atual:    {m: 0.0 for m in range(1, 13)}}
+    desp_liq = {ano_anterior: {m: 0.0 for m in range(1, 13)},
+                ano_atual:    {m: 0.0 for m in range(1, 13)}}
+    rpnp_ins = {ano_anterior: 0.0, ano_atual: 0.0}
+    rpnp_can = {ano_anterior: {m: 0.0 for m in range(1, 13)},
+                ano_atual:    {m: 0.0 for m in range(1, 13)}}
+    max_mes  = 0
+
+    for r in rows:
+        cc   = str(r.get("cocontacontabil") or "").strip()
+        ccor = str(r.get("cocontacorrente") or "").strip()
+        nat  = str(r.get("conatureza")      or "").strip()
+        mes  = int(r.get("inmes") or 0)
+        ano  = int(r.get("coexercicio") or 0)
+        vacr = float(r.get("vacredito") or 0)
+        vad  = float(r.get("vadebito")  or 0)
+        mmf  = r.get("max_mes_fechado")
+        if mmf is not None:
+            try:
+                max_mes = max(max_mes, int(mmf))
+            except (ValueError, TypeError):
+                pass
+        if ano not in rec:
+            continue
+        try:
+            cc_int = int(cc)
+        except (ValueError, TypeError):
+            continue
+        nat2 = nat[1:2] if len(nat) >= 2 else ""
+        val  = vacr - vad
+
+        if (621200000 <= cc_int <= 621390199
+                and ccor[:1] in ('1', '7')
+                and 1 <= mes <= 12):
+            rec[ano][mes] += val
+        elif (cc[:7] in ('6221303', '6221304', '6221307')
+                and nat2 in ('1', '2', '3')
+                and 1 <= mes <= 12):
+            desp_liq[ano][mes] += val
+        elif (cc_int in (631100000, 631200000)
+                and nat2 in ('1', '2', '3')
+                and mes == 0):
+            rpnp_ins[ano] += val
+        elif (cc_int == 631900000
+                and nat2 in ('1', '2', '3', '7')
+                and 1 <= mes <= 12):
+            rpnp_can[ano][mes] += val
+
+    if max_mes == 0:
+        max_mes = next((m for m in range(12, 0, -1)
+                        if rec[ano_atual][m] != 0.0), 1)
+
+    por_mes = {}
+    for mes in range(1, max_mes + 1):
+        rec_12m  = (sum(rec[ano_anterior][m]      for m in range(mes + 1, 13))
+                  + sum(rec[ano_atual][m]          for m in range(1, mes + 1)))
+        desp_12m = (sum(desp_liq[ano_anterior][m] for m in range(mes + 1, 13))
+                  + sum(desp_liq[ano_atual][m]     for m in range(1, mes + 1)))
+        rpnp_i   = rpnp_ins[ano_anterior]
+        rpnp_c   = sum(rpnp_can[ano_atual][m] for m in range(1, mes + 1))
+        desp_cor = desp_12m + rpnp_i - rpnp_c
+        pct      = round(desp_cor / rec_12m * 100, 2) if rec_12m else None
+        por_mes[str(mes)] = {
+            "rec_corrente_12m":    round(rec_12m,  2),
+            "desp_liquidadas_12m": round(desp_12m, 2),
+            "rpnp_inscrito":       round(rpnp_i,   2),
+            "rpnp_cancelado":      round(rpnp_c,   2),
+            "desp_corrente_12m":   round(desp_cor, 2),
+            "poupanca_pct":        pct,
+        }
+
+    log.info(f"  Poupança Corrente: max_mes={max_mes}, meses={list(por_mes.keys())}")
+    return {
+        "ano_atual":  ano_atual,
+        "max_mes":    max_mes,
+        "limite_pct": 95.0,
+        "por_mes":    por_mes,
+    }
+
+
+def save_poupanca_corrente_gz(D_obj):
+    payload = {"atualizado_em": datetime.now(timezone.utc).isoformat()}
+    payload.update(D_obj)
+    content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    gz_path = GZ_DIR / "poupanca_corrente.json.gz"
+    with gzip.open(gz_path, "wb", compresslevel=9) as f:
+        f.write(content)
+    size_kb = gz_path.stat().st_size / 1024
+    log.info(f"  poupanca_corrente.json.gz -- {size_kb:.1f} KB")
+
+
+def upsert_poupanca_corrente_supabase(D_obj):
+    """Envia poupanca_corrente para o Supabase como JSONB (1 linha por ano)."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        log.warning("  Supabase: nao configurado. Pulando upsert poupanca_corrente.")
+        return
+    try:
+        ano = D_obj.get("ano_atual") or datetime.now().year
+        payload = [{
+            "ano":           ano,
+            "dados":         D_obj,
+            "atualizado_em": datetime.now(timezone.utc).isoformat(),
+        }]
+        total = _supabase_upsert("poupanca_corrente", payload, "ano")
+        log.info(f"  Supabase: poupanca_corrente {ano} enviada ({total} linha).")
+    except Exception as e:
+        log.error(f"  Supabase poupanca_corrente falhou: {type(e).__name__}: {e}")
+
+
 def build_resultado_primario_nominal_data(rows):
     """
     Computa o RREO Anexo 06 (Acima da Linha) com todos os sub-níveis,
@@ -1008,6 +1131,11 @@ def run():
                         D_obj = build_resultado_primario_nominal_data(data)
                         save_resultado_primario_nominal_gz(D_obj)
                         upsert_resultado_primario_nominal_supabase(D_obj)
+                        save_json(item["file"], data)
+                    elif item.get("transform") == "poupanca_corrente":
+                        D_obj = build_poupanca_corrente_data(data)
+                        save_poupanca_corrente_gz(D_obj)
+                        upsert_poupanca_corrente_supabase(D_obj)
                         save_json(item["file"], data)
                     elif item["file"] == "receita.json":
                         save_json(item["file"], data)
