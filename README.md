@@ -2,7 +2,7 @@
 
 Dashboards interativos de execução orçamentária do Governo do Distrito Federal, publicados via GitHub Pages e alimentados por ETL automatizado a partir do banco Oracle.
 
-🔗 **Acesso público:** https://contadoriadf.github.io/dashboard/
+🔗 **Acesso público:** https://sefindf.github.io/dashboard/
 
 ---
 
