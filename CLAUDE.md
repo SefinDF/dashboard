@@ -10,7 +10,7 @@ Dashboards interativos de execução orçamentária do Governo do Distrito Feder
 
 - **Organização GitHub:** SefinDF
 - **Repositório:** dashboard
-- **URL pública:** https://SefinDF.github.io/dashboard/
+- **URL pública:** https://sefindf.github.io/dashboard/
 - **Responsável técnico:** James (james.coelho) — ContDF/SEEC
 
 ---
